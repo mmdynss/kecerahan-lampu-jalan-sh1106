@@ -1,0 +1,270 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <BH1750.h>
+#include <TinyGPS++.h>
+#include <U8g2lib.h>
+#include "bitmap_logo.h"
+
+// ================== PIN SETTING ======================
+#define SD_CS         5
+#define GPS_RX        16
+#define GPS_TX        17
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+// ================== OBJEK ============================
+BH1750 lightMeter;
+TinyGPSPlus gps;
+HardwareSerial GPSserial(1);
+U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+File dataFile;
+
+// ================== VARIABEL GLOBAL ==================
+unsigned long lastLogTime = 0;
+const unsigned long logInterval = 1000;
+String currentLogFile = "";
+char autoLogFile[20];
+
+float lat = 0.0;
+float lng = 0.0;
+float speed = 0.0;
+int sats = 0;
+float heading = 0.0;
+
+// Koordinat OLED
+const int posLuxX = 50, posLuxY = 10;
+const int posLatX = 50, posLatY = 20;
+const int posLngX = 50, posLngY = 30;
+const int posSpeedX = 50, posSpeedY = 40;
+const int posSatsX = 50, posSatsY = 50;
+const int posDirX  = 105, posDirY = 50;
+const int posDateX = 0,   posDateY = 60;
+
+bool showLogName = false;
+unsigned long lastSwitchTime = 0;
+unsigned long logDisplayStartTime = 0;
+const unsigned long switchInterval = 60000;
+const unsigned long logDisplayDuration = 30000;
+
+// ================== FUNGSI BOOT ANIMASI ==================
+void playBootAnimation() {
+  for (int i = 0; i < epd_bitmap_allArray_LEN; i++) {
+    display.clearBuffer();
+    display.drawXBMP(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, epd_bitmap_allArray[i]);
+    display.sendBuffer();
+    delay(500);  // Bisa diubah ke 250 atau 700 sesuai selera
+  }
+}
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  display.begin();
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x10_tr);
+
+  playBootAnimation();         // Tampilkan animasi boot
+  delay(300);                  // Jeda animasi
+  display.clearBuffer();       // Clear layar (bukan clearDisplay)
+
+  showStatusMessage("Memulai sistem...");
+  delay(1000);
+
+  if (!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+    Serial.println("BH1750 gagal!");
+    showStatusMessage("BH1750 gagal!");
+    while (1);
+  } else {
+    Serial.println("BH1750 siap.");
+    showStatusMessage("BH1750 siap");
+    delay(1000);
+  }
+
+  GPSserial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("GPS siap.");
+  showStatusMessage("GPS siap");
+  delay(1000);
+
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD Card gagal!");
+    showStatusMessage("SD gagal!");
+    while (1);
+  } else {
+    Serial.println("SD Card siap.");
+    showStatusMessage("SD Card siap");
+    delay(1000);
+  }
+
+  createNewLogFileOnBoot();
+  Serial.println("Sistem siap.");
+  showStatusMessage("Sistem siap");
+  delay(1000);
+
+  display.clearBuffer();
+  drawStaticLabels();
+}
+
+// ================== LOOP ==================
+void loop() {
+  while (GPSserial.available()) {
+    gps.encode(GPSserial.read());
+  }
+
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - lastLogTime >= logInterval) {
+    lastLogTime = currentMillis;
+
+    float lux = lightMeter.readLightLevel();
+
+    if (gps.location.isValid() && gps.date.isValid() && gps.time.isValid()) {
+      lat = gps.location.lat();
+      lng = gps.location.lng();
+      speed = gps.speed.kmph();
+      sats = gps.satellites.value();
+      heading = gps.course.deg();
+
+      String dateTimeStr = getDateTimeString(gps.date, gps.time);
+
+      dataFile = SD.open(currentLogFile, FILE_APPEND);
+      if (dataFile) {
+        dataFile.print(dateTimeStr); dataFile.print(",");
+        dataFile.print(lat, 6); dataFile.print(",");
+        dataFile.print(lng, 6); dataFile.print(",");
+        dataFile.print(speed, 2); dataFile.print(",");
+        dataFile.print(sats); dataFile.print(",");
+        dataFile.print(heading, 2); dataFile.print(",");
+        dataFile.println(lux, 2);
+        dataFile.close();
+        Serial.println("Data disimpan ke " + currentLogFile);
+      }
+
+      updateOLEDValues(lux);
+      if (!showLogName) {
+        showDateTimeOLED(dateTimeStr);
+      }
+    } else {
+      displayGPSSearching();
+      Serial.println("GPS belum valid...");
+    }
+  }
+
+  unsigned long now = millis();
+  if (!showLogName && (now - lastSwitchTime >= switchInterval)) {
+    showLogName = true;
+    logDisplayStartTime = now;
+    lastSwitchTime = now;
+    showLogFileOLED();
+  }
+
+  if (showLogName && (now - logDisplayStartTime >= logDisplayDuration)) {
+    showLogName = false;
+  }
+}
+
+// ================== FUNGSI TAMBAHAN =======================
+void createNewLogFileOnBoot() {
+  int fileNumber = 1;
+  while (true) {
+    sprintf(autoLogFile, "/log_%03d.txt", fileNumber);
+    if (!SD.exists(autoLogFile)) {
+      File f = SD.open(autoLogFile, FILE_WRITE);
+      if (f) {
+        f.println("DateTime,Latitude,Longitude,Speed(km/h),Satellites,Heading,Lux");
+        f.close();
+        currentLogFile = String(autoLogFile);
+        Serial.print("File log baru dibuat: ");
+        Serial.println(currentLogFile);
+      }
+      break;
+    }
+    fileNumber++;
+  }
+}
+
+String getDateTimeString(TinyGPSDate date, TinyGPSTime time) {
+  char buffer[25];
+  sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d",
+          date.year(), date.month(), date.day(),
+          time.hour(), time.minute(), time.second());
+  return String(buffer);
+}
+
+void drawStaticLabels() {
+  display.setFont(u8g2_font_6x10_tr);
+  display.setCursor(0, 10); display.print("Lux    :");
+  display.setCursor(0, 20); display.print("Lat    :");
+  display.setCursor(0, 30); display.print("Lng    :");
+  display.setCursor(0, 40); display.print("Speed  :");
+  display.setCursor(0, 50); display.print("Sats   :");
+  display.setCursor(75, 50); display.print("Dir:");
+  display.sendBuffer();
+}
+
+void updateOLEDValues(float lux) {
+  display.setFont(u8g2_font_6x10_tr);
+  display.setDrawColor(0);
+  display.drawBox(posLuxX, posLuxY - 8, 60, 10);
+  display.drawBox(posLatX, posLatY - 8, 70, 10);
+  display.drawBox(posLngX, posLngY - 8, 70, 10);
+  display.drawBox(posSpeedX, posSpeedY - 8, 70, 10);
+  display.drawBox(posSatsX, posSatsY - 8, 25, 10);
+  display.drawBox(posDirX, posDirY - 8, 25, 10);
+  display.setDrawColor(1);
+
+  display.setCursor(posLuxX, posLuxY); display.print(lux, 2);
+  display.setCursor(posLatX, posLatY); display.print(lat, 6);
+  display.setCursor(posLngX, posLngY); display.print(lng, 6);
+  display.setCursor(posSpeedX, posSpeedY); display.print(speed, 1); display.print(" km/h");
+  display.setCursor(posSatsX, posSatsY); display.print(sats);
+  display.setCursor(posDirX, posDirY); display.print(heading, 0); display.print((char)247);
+
+  display.sendBuffer();
+}
+
+void showDateTimeOLED(String dateTimeStr) {
+  display.setDrawColor(0);
+  display.drawBox(0, posDateY - 8, 128, 10);
+  display.setDrawColor(1);
+  display.setCursor(posDateX, posDateY);
+  display.print(dateTimeStr);
+  display.sendBuffer();
+}
+
+void showLogFileOLED() {
+  display.setDrawColor(0);
+  display.drawBox(0, posDateY - 8, 128, 10);
+  display.setDrawColor(1);
+  String shortFile = currentLogFile;
+  int maxLen = 16;
+  if (shortFile.length() > maxLen) {
+    shortFile = shortFile.substring(shortFile.length() - maxLen);
+  }
+  int x = (128 - display.getStrWidth(shortFile.c_str())) / 2;
+  display.setCursor(x, posDateY);
+  display.print(shortFile);
+  display.sendBuffer();
+}
+
+void displayGPSSearching() {
+  display.setDrawColor(0);
+  display.drawBox(0, posDateY - 8, 128, 10);
+  display.setDrawColor(1);
+  display.setCursor(posDateX, posDateY);
+  display.print("Mencari sinyal GPS...");
+  display.sendBuffer();
+}
+
+void showStatusMessage(String message) {
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x10_tr);
+  int textWidth = display.getStrWidth(message.c_str());
+  int x = (128 - textWidth) / 2;
+  int y = (64 / 2);
+  display.setCursor(x, y);
+  display.print(message);
+  display.sendBuffer();
+}
